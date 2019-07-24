@@ -46,7 +46,7 @@ def a2c_update(model, num_steps, num_procs):
 
         # log_probs: (80,4)
         pred_values, action_probs = model.output
-        log_probs = K.log(action_probs + 1e-7)
+        log_probs = K.log(action_probs + 1e-5)
 
         # action_log_probs: (80, 1)
         # a[i][j] = log_probs[i][actions[i][j]]
@@ -85,28 +85,40 @@ class Environment:
     NUM_STACK_FRAME = 4
     TOTAL_FRAMES=10e+6
     NUM_ADVANCED_STEP = 5
-    NUM_PROCESSES = 16
-    NUM_UPDATES = int(TOTAL_FRAMES / NUM_ADVANCED_STEP / NUM_PROCESSES)
+    NUM_TRAIN_PROCS = 16
+    NUM_UPDATES = int(TOTAL_FRAMES / NUM_ADVANCED_STEP / NUM_TRAIN_PROCS)
     GAMMA = 0.99
 
-    def __init__(self):
-        self.env = self.make_env('BreakoutNoFrameskip-v4')
+    def __init__(self, env_name, train=True, model_path=""):
+        self.train = train
+        if self.train:
+            self.env = self.make_env(env_name, self.NUM_TRAIN_PROCS)
+            self.num_procs = self.NUM_TRAIN_PROCS
+        else: # play
+            self.env = self.make_env(env_name, 1)
+            self.num_procs = 1
+
+        # action_num: difference
         self.action_num = self.env.action_space.n
         # env_obs_shape: (84, 84, 1)
-        env_obs_shape = self.env.observation_space.shape
         # obs_shape: (84, 84, 4)
+        env_obs_shape = self.env.observation_space.shape
         self.obs_shape = (*env_obs_shape[:2], env_obs_shape[-1] * self.NUM_STACK_FRAME)
 
         # model 
         # input: (None, 84, 84, 4)
         # output: [(1,),(n_out,)]
-        self.model = a2c_model(self.obs_shape, self.action_num)
-        self.update = a2c_update(self.model, self.NUM_ADVANCED_STEP, self.NUM_PROCESSES)
+        if self.train:
+            self.model = a2c_model(self.obs_shape, self.action_num)
+            self.update = a2c_update(self.model, self.NUM_ADVANCED_STEP, self.NUM_TRAIN_PROCS)
+        else:
+            self.model = keras.models.load_model(model_path)
+
         # compile model. 
         self.model.summary()
 
 
-    def make_env(self, env_name):
+    def make_env(self, env_name, num_procs):
         def atari_env(env_name, seed):
             def env_func():
                 env = gym.make(env_name)
@@ -119,33 +131,33 @@ class Environment:
                 return env
             return env_func
         
-        envs = [atari_env(env_name, i+1) for i in range(self.NUM_PROCESSES)]
+        envs = [atari_env(env_name, i+1) for i in range(num_procs)]
         env = SubprocVecEnv(envs)
         return env
 
     def run(self):
         # current_obs: (16, 84, 84, 4)
-        current_obs = np.zeros([self.NUM_PROCESSES, *self.obs_shape])
+        current_obs = np.zeros([self.num_procs, *self.obs_shape])
         # episodic_rewards: (16, 1)
-        episode_rewards = np.zeros([self.NUM_PROCESSES, 1])
+        episode_rewards = np.zeros([self.num_procs, 1])
         # final_rewards: (16, 1)
-        final_rewards = np.zeros([self.NUM_PROCESSES, 1])
+        final_rewards = np.zeros([self.num_procs, 1])
 
         # obs: (16, 84, 84, 1)
         obs = self.env.reset()
         current_obs[:, :, :, :1] = obs  
 
-        steps_obs      = np.zeros([self.NUM_ADVANCED_STEP + 1, self.NUM_PROCESSES, *self.obs_shape])
-        steps_masks    = np.zeros([self.NUM_ADVANCED_STEP + 1, self.NUM_PROCESSES, 1])
-        steps_rewards  = np.zeros([self.NUM_ADVANCED_STEP, self.NUM_PROCESSES, 1])
-        steps_actions  = np.zeros([self.NUM_ADVANCED_STEP, self.NUM_PROCESSES, 1], dtype=np.int32)
-        steps_drewards = np.zeros([self.NUM_ADVANCED_STEP + 1, self.NUM_PROCESSES, 1])
+        steps_obs      = np.zeros([self.NUM_ADVANCED_STEP + 1, self.num_procs, *self.obs_shape])
+        steps_masks    = np.zeros([self.NUM_ADVANCED_STEP + 1, self.num_procs, 1])
+        steps_rewards  = np.zeros([self.NUM_ADVANCED_STEP, self.num_procs, 1])
+        steps_actions  = np.zeros([self.NUM_ADVANCED_STEP, self.num_procs, 1], dtype=np.int32)
+        steps_drewards = np.zeros([self.NUM_ADVANCED_STEP + 1, self.num_procs, 1])
         steps_obs[0] = current_obs
 
         for idx in tqdm(range(self.NUM_UPDATES)):
             for step in range(self.NUM_ADVANCED_STEP):
                 _, action_probs = self.model.predict(steps_obs[step] / 255.)
-                action_probs += 1e-7
+                action_probs += 1e-5
                 action_probs /= action_probs.sum(axis=-1).reshape(-1,1)
                 action = np.argmax(np.array([np.random.multinomial(1, x) for x in action_probs]), axis=1)
                 obs, reward, done, _ = self.env.step(action)
@@ -174,40 +186,51 @@ class Environment:
                 steps_rewards[step] = reward
                 steps_actions[step] = action
 
-            # pred_value: (16,) -> (16, 1)
-            stepend_obs = steps_obs[-1]  / 255.
-            pred_value, _ = self.model.predict(stepend_obs)
-            pred_value = pred_value.reshape(-1,1)
+            if self.train:
+                # pred_value: (16,) -> (16, 1)
+                stepend_obs = steps_obs[-1]  / 255.
+                pred_value, _ = self.model.predict(stepend_obs)
+                pred_value = pred_value.reshape(-1,1)
 
-            # calculate discounted values.
-            steps_drewards[-1] = pred_value
-            for step in reversed(range(self.NUM_ADVANCED_STEP)):
-                steps_drewards[step] = steps_rewards[step] + self.GAMMA * steps_drewards[step + 1] * steps_masks[step + 1]
+                # calculate discounted values.
+                steps_drewards[-1] = pred_value
+                for step in reversed(range(self.NUM_ADVANCED_STEP)):
+                    steps_drewards[step] = steps_rewards[step] + self.GAMMA * steps_drewards[step + 1] * steps_masks[step + 1]
 
-            # update network.
-            flatten_obs      = steps_obs[:-1].reshape(-1, *self.obs_shape) / 255.
-            flatten_actions  = steps_actions.reshape(-1, 1)
-            flatten_drewards = steps_drewards[:-1].reshape(-1, 1)
-            self.update([flatten_obs, flatten_actions, flatten_drewards])
+                # update network.
+                flatten_obs      = steps_obs[:-1].reshape(-1, *self.obs_shape) / 255.
+                flatten_actions  = steps_actions.reshape(-1, 1)
+                flatten_drewards = steps_drewards[:-1].reshape(-1, 1)
+                self.update([flatten_obs, flatten_actions, flatten_drewards])
             
-            steps_obs[0] = steps_obs[-1]
-            steps_masks[0] = steps_masks[-1]
+                steps_obs[0] = steps_obs[-1]
+                steps_masks[0] = steps_masks[-1]
 
-            # output logs.
-            if idx % 20 == 0:
-                print("finished frames {}, mean/median reward {:.1f}/{:.1f}, min/max reward {:.1f}/{:.1f}".
-                      format(idx*self.NUM_PROCESSES*self.NUM_ADVANCED_STEP,
-                             final_rewards.mean(), np.median(final_rewards),
-                             final_rewards.min(),final_rewards.max()))
+                # output train logs.
+                if idx % 100 == 0:
+                    print("finished frames {}, mean/median reward {:.1f}/{:.1f}, min/max reward {:.1f}/{:.1f}".
+                          format(idx*self.num_procs*self.NUM_ADVANCED_STEP,
+                                 final_rewards.mean(), np.median(final_rewards),
+                                 final_rewards.min(),final_rewards.max()))
 
-            # 結合パラメータの保存
-            if idx % 12500 == 0:
-                self.model.save('weight_'+str(idx)+'.pth')
+                # save models
+                if idx % 12500 == 0:
+                    self.model.save('weight_'+str(idx)+'.pth')
+            else: # play
+                self.env.render()
         
-        # 実行ループの終了
-        self.model.save('weight_end.pth')
+        if self.train:
+            # save final model
+            self.model.save('weight_end.pth')
 
 
 if __name__=="__main__":
-    breakout_env = Environment()
+    import sys
+    mode = sys.argv[1]
+    if mode=="train":
+        breakout_env = Environment('BreakoutNoFrameskip-v4', True)
+    else: # play
+        model_path = sys.argv[2]
+        breakout_env = Environment('BreakoutNoFrameskip-v4', False, model_path)
+    
     breakout_env.run()
