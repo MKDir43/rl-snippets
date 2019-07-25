@@ -226,11 +226,22 @@ class Environment:
 
 if __name__=="__main__":
     import sys
-    mode = sys.argv[1]
+    if len(sys.argv) < 3:
+        print("usage: {} env_id is_train model_path".format(sys.argv[0]))
+        print()
+        print("Atari Environments List")
+        atari_specs = [spec for spec in gym.envs.registry.all() 
+                if spec.id.endswith("NoFrameskip-v4") and not spec.id.endswith("ramNoFrameskip-v4")]
+        for idx, spec in enumerate(atari_specs):
+            print("No.{:03}: {}".format(idx, spec.id) )
+        exit()
+
+    env_id = sys.argv[1]
+    mode = sys.argv[2]
     if mode=="train":
-        breakout_env = Environment('BreakoutNoFrameskip-v4', True)
+        breakout_env = Environment(env_id, True)
     else: # play
-        model_path = sys.argv[2]
-        breakout_env = Environment('BreakoutNoFrameskip-v4', False, model_path)
+        model_path = sys.argv[3]
+        breakout_env = Environment(env_id, False, model_path)
     
     breakout_env.run()
