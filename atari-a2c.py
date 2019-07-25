@@ -105,6 +105,9 @@ class Environment:
         env_obs_shape = self.env.observation_space.shape
         self.obs_shape = (*env_obs_shape[:2], env_obs_shape[-1] * self.NUM_STACK_FRAME)
 
+        print("state: {}".format(self.obs_shape))
+        print("actions: {}".format(self.action_num))
+
         # model 
         # input: (None, 84, 84, 4)
         # output: [(1,),(n_out,)]
@@ -216,6 +219,7 @@ class Environment:
                 # save models
                 if idx % 12500 == 0:
                     self.model.save('weight_'+str(idx)+'.pth')
+                
             else: # play
                 self.env.render()
         
@@ -239,9 +243,9 @@ if __name__=="__main__":
     env_id = sys.argv[1]
     mode = sys.argv[2]
     if mode=="train":
-        breakout_env = Environment(env_id, True)
+        env = Environment(env_id, True)
     else: # play
         model_path = sys.argv[3]
-        breakout_env = Environment(env_id, False, model_path)
+        env = Environment(env_id, False, model_path)
     
-    breakout_env.run()
+    env.run()
